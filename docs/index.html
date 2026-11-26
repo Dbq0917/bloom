@@ -84,7 +84,7 @@
         <li>Membership queries with <strong>zero false negatives</strong> and a tunable false-positive rate.</li>
         <li>Automatic sizing from a target capacity and error rate via <code>NewWithEstimates</code>.</li>
         <li><code>Add</code>, <code>Test</code>, and the combined <code>TestAndAdd</code> / <code>TestOrAdd</code> primitives, plus <code>*String</code> variants.</li>
-        <li>Set algebra across compatible filters with <code>Merge</code> and <code>Copy</code>.</li>
+        <li>Set algebra with <code>Merge</code> and <code>Copy</code>, including filters built with different parameters.</li>
         <li>Cardinality estimation with <code>ApproximatedSize</code> and rate validation with <code>EstimateFalsePositiveRate</code>.</li>
         <li>Portable binary serialization plus <code>json</code>, <code>gob</code>, and <code>BinaryMarshaler</code> support.</li>
         <li>Backed by a compact <a href="https://github.com/bits-and-blooms/bitset" target="_blank" rel="noopener">bitset</a> and the fast, non-cryptographic murmur3 hash.</li>

@@ -78,6 +78,23 @@ type BloomFilter struct {
 	m uint
 	k uint
 	b *bitset.BitSet
+	// extra holds filters that could not be combined with this one because
+	// their parameters differ. It is nil for ordinary filters.
+	extra *mergedFilters
+}
+
+// mergedFilters holds Bloom filters with parameters different from the filter
+// they are attached to. Queries test all of them, so keys from every merged
+// filter remain visible without rehashing.
+type mergedFilters struct {
+	filters []*BloomFilter
+}
+
+func (f *BloomFilter) extraFilters() []*BloomFilter {
+	if f.extra == nil {
+		return nil
+	}
+	return f.extra.filters
 }
 
 func max(x, y uint) uint {
@@ -90,7 +107,7 @@ func max(x, y uint) uint {
 // New creates a new Bloom filter with _m_ bits and _k_ hashing functions
 // We force _m_ and _k_ to be at least one to avoid panics.
 func New(m uint, k uint) *BloomFilter {
-	return &BloomFilter{max(1, m), max(1, k), bitset.New(m)}
+	return &BloomFilter{m: max(1, m), k: max(1, k), b: bitset.New(m)}
 }
 
 // From creates a new Bloom filter with len(_data_) * 64 bits and _k_ hashing
@@ -103,7 +120,7 @@ func From(data []uint64, k uint) *BloomFilter {
 // FromWithM creates a new Bloom filter with _m_ length, _k_ hashing functions.
 // The data slice is not going to be reset.
 func FromWithM(data []uint64, m, k uint) *BloomFilter {
-	return &BloomFilter{m, k, bitset.From(data)}
+	return &BloomFilter{m: m, k: k, b: bitset.From(data)}
 }
 
 // baseHashes returns the four hash values of data that are used to create k
@@ -143,17 +160,23 @@ func NewWithEstimates(n uint, fp float64) *BloomFilter {
 	return New(m, k)
 }
 
-// Cap returns the capacity, _m_, of a Bloom filter
+// Cap returns the capacity, _m_, of a Bloom filter. If the filter contains
+// parts merged with different parameters, Cap reports the receiver's
+// original capacity; each part retains its own.
 func (f *BloomFilter) Cap() uint {
 	return f.m
 }
 
-// K returns the number of hash functions used in the BloomFilter
+// K returns the number of hash functions used in the BloomFilter. If the
+// filter contains parts merged with different parameters, K reports the
+// receiver's original value; each part retains its own.
 func (f *BloomFilter) K() uint {
 	return f.k
 }
 
-// BitSet returns the underlying bitset for this filter.
+// BitSet returns the underlying bitset for this filter. If the filter contains
+// parts merged with different parameters, this is the receiver's bitset; the
+// parts are kept separately.
 func (f *BloomFilter) BitSet() *bitset.BitSet {
 	return f.b
 }
@@ -167,26 +190,86 @@ func (f *BloomFilter) Add(data []byte) *BloomFilter {
 	return f
 }
 
-// Merge the data from two Bloom Filters.
+// Merge adds all the keys of g to f.
+//
+// Filters with the same m and k are combined by a bitwise union. Filters with
+// different parameters cannot be combined that way without losing keys, so
+// they are retained as additional parts and tested in turn. This is
+// equivalent to inserting both sets of keys: keys present in either filter
+// are always found. The false positive rate of the result is approximately
+// the combination of the rates of its parts (1 - prod(1-p_i), at most their
+// sum) rather than the rate of either input alone. Memory use is the sum of
+// the parts, not their product, and is proportional to the number of distinct
+// (m, k) pairs.
 func (f *BloomFilter) Merge(g *BloomFilter) error {
-	// Make sure the m's and k's are the same, otherwise merging has no real use.
-	if f.m != g.m {
-		return fmt.Errorf("m's don't match: %d != %d", f.m, g.m)
+	if g == nil {
+		return fmt.Errorf("cannot merge a nil Bloom filter")
 	}
-
-	if f.k != g.k {
-		return fmt.Errorf("k's don't match: %d != %d", f.k, g.k)
+	if f == g {
+		return nil
 	}
-
-	f.b.InPlaceUnion(g.b)
+	for _, part := range g.allParts() {
+		f.absorb(part)
+	}
 	return nil
+}
+
+// allParts returns f followed by every filter merged into it, flattening
+// nested merges.
+func (f *BloomFilter) allParts() []*BloomFilter {
+	parts := []*BloomFilter{f}
+	if f.extra != nil {
+		for _, part := range f.extra.filters {
+			parts = append(parts, part.allParts()...)
+		}
+	}
+	return parts
+}
+
+// absorb adds part to f, combining bitsets when their parameters match.
+func (f *BloomFilter) absorb(part *BloomFilter) {
+	if f.m == part.m && f.k == part.k {
+		f.b.InPlaceUnion(part.b)
+		return
+	}
+	if f.extra != nil {
+		for _, existing := range f.extra.filters {
+			if existing.m == part.m && existing.k == part.k {
+				existing.b.InPlaceUnion(part.b)
+				return
+			}
+		}
+	}
+	if f.extra == nil {
+		f.extra = &mergedFilters{}
+	}
+	f.extra.filters = append(f.extra.filters, part.cloneSelf())
+}
+
+// clone returns a deep copy of f, including any merged parts.
+func (f *BloomFilter) clone() *BloomFilter {
+	fc := f.cloneSelf()
+	if f.extra != nil {
+		fc.extra = &mergedFilters{filters: make([]*BloomFilter, 0, len(f.extra.filters))}
+		for _, part := range f.extra.filters {
+			fc.extra.filters = append(fc.extra.filters, part.clone())
+		}
+	}
+	return fc
+}
+
+// cloneSelf returns a deep copy of a single filter, without merged parts.
+func (f *BloomFilter) cloneSelf() *BloomFilter {
+	fc := &BloomFilter{m: f.m, k: f.k}
+	if f.b != nil {
+		fc.b = f.b.Clone()
+	}
+	return fc
 }
 
 // Copy creates a copy of a Bloom filter.
 func (f *BloomFilter) Copy() *BloomFilter {
-	fc := New(f.m, f.k)
-	fc.Merge(f) // #nosec
-	return fc
+	return f.clone()
 }
 
 // AddString to the Bloom Filter. Returns the filter (allows chaining)
@@ -198,9 +281,19 @@ func (f *BloomFilter) AddString(data string) *BloomFilter {
 // If true, the result might be a false positive. If false, the data
 // is definitely not in the set.
 func (f *BloomFilter) Test(data []byte) bool {
-	h := baseHashes(data)
+	return f.testHashes(baseHashes(data))
+}
+
+func (f *BloomFilter) testHashes(h [4]uint64) bool {
 	for i := uint(0); i < f.k; i++ {
 		if !f.b.Test(f.location(h, i)) {
+			if f.extra != nil {
+				for _, part := range f.extra.filters {
+					if part.testHashes(h) {
+						return true
+					}
+				}
+			}
 			return false
 		}
 	}
@@ -217,6 +310,33 @@ func (f *BloomFilter) TestString(data string) bool {
 // TestLocations returns true if all locations are set in the BloomFilter, false
 // otherwise.
 func (f *BloomFilter) TestLocations(locs []uint64) bool {
+	if f.extra == nil {
+		return f.testLocationsSelf(locs)
+	}
+	return f.testLocationsMerged(locs)
+}
+
+func (f *BloomFilter) testLocationsMerged(locs []uint64) bool {
+	n := len(locs)
+	if uint(n) > f.k {
+		n = int(f.k)
+	}
+	for i := 0; i < n; i++ {
+		if !f.b.Test(uint(locs[i] % uint64(f.m))) {
+			if f.extra != nil {
+				for _, part := range f.extra.filters {
+					if part.testLocationsMerged(locs) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (f *BloomFilter) testLocationsSelf(locs []uint64) bool {
 	for i := 0; i < len(locs); i++ {
 		if !f.b.Test(uint(locs[i] % uint64(f.m))) {
 			return false
@@ -230,13 +350,10 @@ func (f *BloomFilter) TestLocations(locs []uint64) bool {
 // the corresponding bits are still set. See also TestOrAdd.
 // Returns the result of Test.
 func (f *BloomFilter) TestAndAdd(data []byte) bool {
-	present := true
 	h := baseHashes(data)
+	present := f.testHashes(h)
 	for i := uint(0); i < f.k; i++ {
 		l := f.location(h, i)
-		if !f.b.Test(l) {
-			present = false
-		}
 		f.b.Set(l)
 	}
 	return present
@@ -254,16 +371,15 @@ func (f *BloomFilter) TestAndAddString(data string) bool {
 // If the element is already in the filter, then the filter is unchanged.
 // Returns the result of Test.
 func (f *BloomFilter) TestOrAdd(data []byte) bool {
-	present := true
 	h := baseHashes(data)
+	if f.testHashes(h) {
+		return true
+	}
 	for i := uint(0); i < f.k; i++ {
 		l := f.location(h, i)
-		if !f.b.Test(l) {
-			present = false
-			f.b.Set(l)
-		}
+		f.b.Set(l)
 	}
-	return present
+	return false
 }
 
 // TestOrAddString is the equivalent to calling Test(string) then if not present Add(string).
@@ -276,6 +392,11 @@ func (f *BloomFilter) TestOrAddString(data string) bool {
 // ClearAll clears all the data in a Bloom filter, removing all keys
 func (f *BloomFilter) ClearAll() *BloomFilter {
 	f.b.ClearAll()
+	if f.extra != nil {
+		for _, part := range f.extra.filters {
+			part.ClearAll()
+		}
+	}
 	return f
 }
 
@@ -314,7 +435,25 @@ func EstimateFalsePositiveRate(m, k, n uint) (fpRate float64) {
 //
 // It returns 0 for an empty filter. It returns math.MaxUint32 when the filter
 // is saturated (all bits set) or when the estimate does not fit in a uint32.
+// For a filter containing merged parts, the estimates of all parts are summed.
 func (f *BloomFilter) ApproximatedSize() uint32 {
+	total := uint64(f.approximatedSize())
+	if f.extra != nil {
+		for _, part := range f.extra.filters {
+			size := uint64(part.ApproximatedSize())
+			if total > uint64(math.MaxUint32)-size {
+				return math.MaxUint32
+			}
+			total += size
+		}
+	}
+	if total > uint64(math.MaxUint32) {
+		return math.MaxUint32
+	}
+	return uint32(total)
+}
+
+func (f *BloomFilter) approximatedSize() uint32 {
 	x := float64(f.b.Count())
 	if x == 0 {
 		return 0
@@ -335,14 +474,25 @@ func (f *BloomFilter) ApproximatedSize() uint32 {
 
 // bloomFilterJSON is an unexported type for marshaling/unmarshaling BloomFilter struct.
 type bloomFilterJSON struct {
-	M uint           `json:"m"`
-	K uint           `json:"k"`
-	B *bitset.BitSet `json:"b"`
+	M     uint              `json:"m"`
+	K     uint              `json:"k"`
+	B     *bitset.BitSet    `json:"b"`
+	Parts []bloomFilterJSON `json:"parts,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler interface.
 func (f BloomFilter) MarshalJSON() ([]byte, error) {
-	return json.Marshal(bloomFilterJSON{f.m, f.k, f.b})
+	return json.Marshal(f.jsonValue())
+}
+
+func (f BloomFilter) jsonValue() bloomFilterJSON {
+	j := bloomFilterJSON{M: f.m, K: f.k, B: f.b}
+	if f.extra != nil {
+		for _, part := range f.extra.filters {
+			j.Parts = append(j.Parts, part.jsonValue())
+		}
+	}
+	return j
 }
 
 // UnmarshalJSON implements json.Unmarshaler interface.
@@ -352,11 +502,26 @@ func (f *BloomFilter) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	f.m = j.M
-	f.k = j.K
-	f.b = j.B
+	*f = *j.filter()
 	return nil
 }
+
+func (j bloomFilterJSON) filter() *BloomFilter {
+	f := &BloomFilter{m: j.M, k: j.K, b: j.B}
+	if len(j.Parts) > 0 {
+		f.extra = &mergedFilters{filters: make([]*BloomFilter, 0, len(j.Parts))}
+		for _, part := range j.Parts {
+			f.extra.filters = append(f.extra.filters, part.filter())
+		}
+	}
+	return f
+}
+
+// mergedFormatMagic marks the binary representation of a filter that carries
+// additional differently-parameterized parts. A normal filter always starts
+// with m, which cannot have the high bit set because such a filter could not
+// be allocated.
+const mergedFormatMagic uint64 = 1<<63 | 0x626c6f6f6d2d756e // "bloom-un"
 
 // WriteTo writes a binary representation of the BloomFilter to an i/o stream.
 // It returns the number of bytes written.
@@ -368,6 +533,29 @@ func (f *BloomFilter) UnmarshalJSON(data []byte) error {
 //	      f, err := os.Create("myfile")
 //		       w := bufio.NewWriter(f)
 func (f *BloomFilter) WriteTo(stream io.Writer) (int64, error) {
+	if f.extra != nil && len(f.extra.filters) > 0 {
+		parts := f.allParts()
+		written := int64(binary.Size(uint64(0)))
+		if err := binary.Write(stream, binary.BigEndian, mergedFormatMagic); err != nil {
+			return 0, err
+		}
+		if err := binary.Write(stream, binary.BigEndian, uint64(len(parts))); err != nil {
+			return written, err
+		}
+		written += int64(binary.Size(uint64(0)))
+		for _, part := range parts {
+			numBytes, err := part.writeTo(stream)
+			written += numBytes
+			if err != nil {
+				return written, err
+			}
+		}
+		return written, nil
+	}
+	return f.writeTo(stream)
+}
+
+func (f *BloomFilter) writeTo(stream io.Writer) (int64, error) {
 	err := binary.Write(stream, binary.BigEndian, uint64(f.m))
 	if err != nil {
 		return 0, err
@@ -391,13 +579,56 @@ func (f *BloomFilter) WriteTo(stream io.Writer) (int64, error) {
 //	f, err := os.Open("myfile")
 //	r := bufio.NewReader(f)
 func (f *BloomFilter) ReadFrom(stream io.Reader) (int64, error) {
-	var m, k uint64
-	err := binary.Read(stream, binary.BigEndian, &m)
-	if err != nil {
+	var first uint64
+	if err := binary.Read(stream, binary.BigEndian, &first); err != nil {
 		return 0, err
 	}
-	err = binary.Read(stream, binary.BigEndian, &k)
-	if err != nil {
+	if first != mergedFormatMagic {
+		numBytes, err := f.readFrom(stream, first)
+		if err != nil {
+			return 0, err
+		}
+		return numBytes + int64(binary.Size(uint64(0))), nil
+	}
+
+	var count uint64
+	if err := binary.Read(stream, binary.BigEndian, &count); err != nil {
+		return int64(binary.Size(uint64(0))), err
+	}
+	if count == 0 {
+		return int64(2 * binary.Size(uint64(0))), fmt.Errorf("invalid merged Bloom filter: no parts")
+	}
+
+	total := int64(2 * binary.Size(uint64(0)))
+	parts := make([]*BloomFilter, 0)
+	for i := uint64(0); i < count; i++ {
+		var m uint64
+		if err := binary.Read(stream, binary.BigEndian, &m); err != nil {
+			return total, err
+		}
+		total += int64(binary.Size(uint64(0)))
+		part := &BloomFilter{}
+		numBytes, err := part.readFrom(stream, m)
+		total += numBytes
+		if err != nil {
+			return total, err
+		}
+		parts = append(parts, part)
+	}
+	f.m = parts[0].m
+	f.k = parts[0].k
+	f.b = parts[0].b
+	if len(parts) > 1 {
+		f.extra = &mergedFilters{filters: parts[1:]}
+	} else {
+		f.extra = nil
+	}
+	return total, nil
+}
+
+func (f *BloomFilter) readFrom(stream io.Reader, m uint64) (int64, error) {
+	var k uint64
+	if err := binary.Read(stream, binary.BigEndian, &k); err != nil {
 		return 0, err
 	}
 	b := &bitset.BitSet{}
@@ -408,7 +639,8 @@ func (f *BloomFilter) ReadFrom(stream io.Reader) (int64, error) {
 	f.m = uint(m)
 	f.k = uint(k)
 	f.b = b
-	return numBytes + int64(2*binary.Size(uint64(0))), nil
+	f.extra = nil
+	return numBytes + int64(binary.Size(uint64(0))), nil
 }
 
 // GobEncode implements gob.GobEncoder interface.
@@ -451,7 +683,20 @@ func (f *BloomFilter) UnmarshalBinary(data []byte) error {
 
 // Equal tests for the equality of two Bloom filters
 func (f *BloomFilter) Equal(g *BloomFilter) bool {
-	return f.m == g.m && f.k == g.k && f.b.Equal(g.b)
+	if f.m != g.m || f.k != g.k || !f.b.Equal(g.b) {
+		return false
+	}
+	fParts := f.extraFilters()
+	gParts := g.extraFilters()
+	if len(fParts) != len(gParts) {
+		return false
+	}
+	for i := 0; i < len(fParts); i++ {
+		if !fParts[i].Equal(gParts[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // Locations returns a list of hash locations representing a data item.

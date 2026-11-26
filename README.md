@@ -88,6 +88,16 @@ You would expect `ActualfpRate` to be close to the desired false-positive rate `
 The `EstimateFalsePositiveRate` function creates a temporary Bloom filter. It is
 also relatively expensive and only meant for validation.
 
+## Merging filters
+
+`Merge` adds every key from one filter to another. Filters with the same `m`
+and `k` are combined by a union of their bitsets. Filters built with different
+parameters are kept as separate parts and tested in turn, so keys from both
+inputs are still found (there are no false negatives). For a non-member, the
+merged false-positive rate is approximately `1 - (1-p1)*(1-p2)`, at most
+`p1+p2`, where `p1` and `p2` are the rates of the parts. Memory use is the sum
+of the parts, not their product.
+
 ## Serialization
 
 You can read and write the Bloom filters as follows:

@@ -1,11 +1,11 @@
 package bloom
 
 import (
-	"fmt"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
+	"fmt"
 	"math"
 	"testing"
 
@@ -315,9 +315,8 @@ func TestMarshalUnmarshalJSON(t *testing.T) {
 	}
 }
 
-
 func TestMarshalUnmarshalJSONValue(t *testing.T) {
-	f:= BloomFilter{1000, 4, bitset.New(1000)}
+	f := BloomFilter{m: 1000, k: 4, b: bitset.New(1000)}
 	data, err := json.Marshal(f)
 	if err != nil {
 		t.Fatal(err.Error())
@@ -522,34 +521,169 @@ func TestMerge(t *testing.T) {
 	n4 := []byte("j")
 	j.Add(n4)
 
-	err := f.Merge(g)
+	if err := f.Merge(g); err != nil {
+		t.Errorf("There should be no error when merging two similar filters: %v", err)
+	}
+
+	if err := f.Merge(h); err != nil {
+		t.Errorf("There should be no error when merging filters with mismatched m: %v", err)
+	}
+
+	if err := f.Merge(j); err != nil {
+		t.Errorf("There should be no error when merging filters with mismatched k: %v", err)
+	}
+
+	for _, n := range [][]byte{n1, n2, n3, n4} {
+		if !f.Test(n) {
+			t.Errorf("The value %q doesn't exist after a merge", n)
+		}
+	}
+
+	k := New(1000, 4)
+	n5 := []byte("k")
+	k.Add(n5)
+	if err := f.Merge(k); err != nil {
+		t.Errorf("There should be no error when merging a matching filter: %v", err)
+	}
+	if !f.Test(n5) {
+		t.Errorf("The value %q doesn't exist after a matching merge", n5)
+	}
+	if got := len(f.extraFilters()); got != 2 {
+		t.Errorf("matching parameters should be combined into the same part, got %d extra parts", got)
+	}
+	if f.extraFilters()[0].b == h.b {
+		t.Error("merged filter aliases the input filter's bitset")
+	}
+}
+
+func TestMergeDifferentParameters(t *testing.T) {
+	f := NewWithEstimates(1000, 0.01)
+	g := NewWithEstimates(2000, 0.001)
+	if f.m == g.m && f.k == g.k {
+		t.Fatal("test requires two filters with different parameters")
+	}
+
+	var keys [][]byte
+	key := make([]byte, 4)
+	for i := uint32(0); i < 1000; i++ {
+		binary.BigEndian.PutUint32(key, i)
+		k := append([]byte(nil), key...)
+		keys = append(keys, k)
+		f.Add(k)
+	}
+	for i := uint32(1000); i < 3000; i++ {
+		binary.BigEndian.PutUint32(key, i)
+		k := append([]byte(nil), key...)
+		keys = append(keys, k)
+		g.Add(k)
+	}
+
+	if err := f.Merge(g); err != nil {
+		t.Fatalf("merging filters with different parameters: %v", err)
+	}
+	for _, k := range keys {
+		if !f.Test(k) {
+			t.Fatalf("key %x is missing after merging filters with different parameters", k)
+		}
+	}
+}
+
+func TestMergeCompositeFilters(t *testing.T) {
+	f1 := New(1000, 4)
+	f2 := New(1100, 5)
+	f3 := New(1200, 6)
+	f4 := New(1300, 7)
+	keys := [][]byte{[]byte("one"), []byte("two"), []byte("three"), []byte("four")}
+	for i, f := range []*BloomFilter{f1, f2, f3, f4} {
+		f.Add(keys[i])
+	}
+
+	if err := f1.Merge(f2); err != nil {
+		t.Fatal(err)
+	}
+	if err := f3.Merge(f4); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Merge(f3); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, k := range keys {
+		if !f1.Test(k) {
+			t.Errorf("key %q is missing after merging composite filters", k)
+		}
+	}
+	if got := len(f1.extraFilters()); got != 3 {
+		t.Errorf("got %d extra parts, want 3", got)
+	}
+	for _, part := range f1.extraFilters() {
+		if part.extra != nil {
+			t.Error("merged parts should be flattened")
+		}
+	}
+}
+
+func TestMergeSerialization(t *testing.T) {
+	f := NewWithEstimates(1000, 0.01)
+	g := NewWithEstimates(2000, 0.001)
+	var keys [][]byte
+	key := make([]byte, 4)
+	for i := uint32(0); i < 3000; i++ {
+		binary.BigEndian.PutUint32(key, i)
+		k := append([]byte(nil), key...)
+		keys = append(keys, k)
+		if i < 1000 {
+			f.Add(k)
+		} else {
+			g.Add(k)
+		}
+	}
+	if err := f.Merge(g); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	written, err := f.WriteTo(&buf)
 	if err != nil {
-		t.Errorf("There should be no error when merging two similar filters")
+		t.Fatal(err)
+	}
+	if written != int64(buf.Len()) {
+		t.Fatalf("incorrect write length %d != %d", written, buf.Len())
+	}
+	var binaryCopy BloomFilter
+	read, err := binaryCopy.ReadFrom(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != written {
+		t.Fatalf("incorrect read length %d != %d", read, written)
 	}
 
-	err = f.Merge(h)
-	if err == nil {
-		t.Errorf("There should be an error when merging filters with mismatched m")
+	data, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jsonCopy BloomFilter
+	if err := json.Unmarshal(data, &jsonCopy); err != nil {
+		t.Fatal(err)
 	}
 
-	err = f.Merge(j)
-	if err == nil {
-		t.Errorf("There should be an error when merging filters with mismatched k")
-	}
-
-	n2b := f.Test(n2)
-	if !n2b {
-		t.Errorf("The value doesn't exist after a valid merge")
-	}
-
-	n3b := f.Test(n3)
-	if n3b {
-		t.Errorf("The value exists after an invalid merge")
-	}
-
-	n4b := f.Test(n4)
-	if n4b {
-		t.Errorf("The value exists after an invalid merge")
+	copies := []*BloomFilter{&binaryCopy, &jsonCopy, f.Copy()}
+	for _, copy := range copies {
+		if !copy.Equal(f) {
+			t.Error("copy is not equal to the merged filter")
+		}
+		for _, k := range keys {
+			if !copy.Test(k) {
+				t.Fatalf("key %x is missing after copying a merged filter", k)
+			}
+		}
+		copy.ClearAll()
+		for _, k := range keys {
+			if copy.Test(k) {
+				t.Fatalf("key %x is still present after ClearAll", k)
+			}
+		}
 	}
 }
 
