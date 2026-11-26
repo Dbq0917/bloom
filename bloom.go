@@ -75,9 +75,11 @@ import (
 // requirement is to make membership queries; _i.e._, whether an item is a
 // member of a set.
 type BloomFilter struct {
-	m uint
-	k uint
-	b *bitset.BitSet
+	m      uint
+	k      uint
+	b      *bitset.BitSet
+	counts []uint64
+	excess map[uint]uint64
 }
 
 func max(x, y uint) uint {
@@ -90,7 +92,7 @@ func max(x, y uint) uint {
 // New creates a new Bloom filter with _m_ bits and _k_ hashing functions
 // We force _m_ and _k_ to be at least one to avoid panics.
 func New(m uint, k uint) *BloomFilter {
-	return &BloomFilter{max(1, m), max(1, k), bitset.New(m)}
+	return &BloomFilter{m: max(1, m), k: max(1, k), b: bitset.New(m)}
 }
 
 // From creates a new Bloom filter with len(_data_) * 64 bits and _k_ hashing
@@ -103,7 +105,7 @@ func From(data []uint64, k uint) *BloomFilter {
 // FromWithM creates a new Bloom filter with _m_ length, _k_ hashing functions.
 // The data slice is not going to be reset.
 func FromWithM(data []uint64, m, k uint) *BloomFilter {
-	return &BloomFilter{m, k, bitset.From(data)}
+	return &BloomFilter{m: m, k: k, b: bitset.From(data)}
 }
 
 // baseHashes returns the four hash values of data that are used to create k
@@ -161,8 +163,11 @@ func (f *BloomFilter) BitSet() *bitset.BitSet {
 // Add data to the Bloom Filter. Returns the filter (allows chaining)
 func (f *BloomFilter) Add(data []byte) *BloomFilter {
 	h := baseHashes(data)
+	f.ensureCounts()
 	for i := uint(0); i < f.k; i++ {
-		f.b.Set(f.location(h, i))
+		location := f.location(h, i)
+		f.b.Set(location)
+		f.incrementCounter(location)
 	}
 	return f
 }
@@ -178,6 +183,7 @@ func (f *BloomFilter) Merge(g *BloomFilter) error {
 		return fmt.Errorf("k's don't match: %d != %d", f.k, g.k)
 	}
 
+	f.mergeCounts(g)
 	f.b.InPlaceUnion(g.b)
 	return nil
 }
@@ -232,12 +238,14 @@ func (f *BloomFilter) TestLocations(locs []uint64) bool {
 func (f *BloomFilter) TestAndAdd(data []byte) bool {
 	present := true
 	h := baseHashes(data)
+	f.ensureCounts()
 	for i := uint(0); i < f.k; i++ {
 		l := f.location(h, i)
 		if !f.b.Test(l) {
 			present = false
 		}
 		f.b.Set(l)
+		f.incrementCounter(l)
 	}
 	return present
 }
@@ -256,11 +264,19 @@ func (f *BloomFilter) TestAndAddString(data string) bool {
 func (f *BloomFilter) TestOrAdd(data []byte) bool {
 	present := true
 	h := baseHashes(data)
+	locs := make([]uint, f.k)
 	for i := uint(0); i < f.k; i++ {
 		l := f.location(h, i)
+		locs[i] = l
 		if !f.b.Test(l) {
 			present = false
+		}
+	}
+	if !present {
+		f.ensureCounts()
+		for _, l := range locs {
 			f.b.Set(l)
+			f.incrementCounter(l)
 		}
 	}
 	return present
@@ -276,6 +292,10 @@ func (f *BloomFilter) TestOrAddString(data string) bool {
 // ClearAll clears all the data in a Bloom filter, removing all keys
 func (f *BloomFilter) ClearAll() *BloomFilter {
 	f.b.ClearAll()
+	for i := range f.counts {
+		f.counts[i] = 0
+	}
+	f.excess = nil
 	return f
 }
 
@@ -335,14 +355,23 @@ func (f *BloomFilter) ApproximatedSize() uint32 {
 
 // bloomFilterJSON is an unexported type for marshaling/unmarshaling BloomFilter struct.
 type bloomFilterJSON struct {
-	M uint           `json:"m"`
-	K uint           `json:"k"`
-	B *bitset.BitSet `json:"b"`
+	M      uint            `json:"m"`
+	K      uint            `json:"k"`
+	B      *bitset.BitSet  `json:"b"`
+	Counts []uint64        `json:"c,omitempty"`
+	Excess map[uint]uint64 `json:"e,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler interface.
 func (f BloomFilter) MarshalJSON() ([]byte, error) {
-	return json.Marshal(bloomFilterJSON{f.m, f.k, f.b})
+	f.ensureCounts()
+	return json.Marshal(bloomFilterJSON{
+		M:      f.m,
+		K:      f.k,
+		B:      f.b,
+		Counts: f.counts,
+		Excess: f.excess,
+	})
 }
 
 // UnmarshalJSON implements json.Unmarshaler interface.
@@ -355,6 +384,13 @@ func (f *BloomFilter) UnmarshalJSON(data []byte) error {
 	f.m = j.M
 	f.k = j.K
 	f.b = j.B
+	if uint(len(j.Counts)) == counterWords(f.m) {
+		f.counts = j.Counts
+		f.excess = j.Excess
+	} else {
+		f.counts = nil
+		f.excess = nil
+	}
 	return nil
 }
 
@@ -377,7 +413,13 @@ func (f *BloomFilter) WriteTo(stream io.Writer) (int64, error) {
 		return 0, err
 	}
 	numBytes, err := f.b.WriteTo(stream)
-	return numBytes + int64(2*binary.Size(uint64(0))), err
+	headerBytes := int64(2 * binary.Size(uint64(0)))
+	if err != nil {
+		return numBytes + headerBytes, err
+	}
+
+	countBytes, err := f.writeDeleteState(stream)
+	return numBytes + headerBytes + countBytes, err
 }
 
 // ReadFrom reads a binary representation of the BloomFilter (such as might
@@ -408,7 +450,9 @@ func (f *BloomFilter) ReadFrom(stream io.Reader) (int64, error) {
 	f.m = uint(m)
 	f.k = uint(k)
 	f.b = b
-	return numBytes + int64(2*binary.Size(uint64(0))), nil
+	headerBytes := int64(2 * binary.Size(uint64(0)))
+	countBytes, err := f.readDeleteState(stream)
+	return numBytes + headerBytes + countBytes, err
 }
 
 // GobEncode implements gob.GobEncoder interface.

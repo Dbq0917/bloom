@@ -317,7 +317,7 @@ func TestMarshalUnmarshalJSON(t *testing.T) {
 
 
 func TestMarshalUnmarshalJSONValue(t *testing.T) {
-	f:= BloomFilter{1000, 4, bitset.New(1000)}
+	f := BloomFilter{m: 1000, k: 4, b: bitset.New(1000)}
 	data, err := json.Marshal(f)
 	if err != nil {
 		t.Fatal(err.Error())

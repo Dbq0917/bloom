@@ -40,6 +40,19 @@ Similarly, to test if `"Love"` is in bloom:
     if filter.Test([]byte("Love"))
 ```
 
+Keys can be removed with `Delete` or `DeleteString`:
+
+```Go
+    filter.Add([]byte("Love"))
+    filter.Delete([]byte("Love"))
+```
+
+Deletion uses per-bit reference counts. A bit shared by another key is kept
+until the last reference using it is removed, so deleting one key does not
+clear another key's bit. Add and Delete calls should be paired. The counters
+use two packed bits per filter bit plus an overflow map for unusually large
+counts; `Test` still reads only the original bit set.
+
 For numerical data, we recommend that you look into the encoding/binary library. But, for example, to add a `uint32` to the filter:
 
 ```Go
