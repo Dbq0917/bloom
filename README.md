@@ -88,6 +88,26 @@ You would expect `ActualfpRate` to be close to the desired false-positive rate `
 The `EstimateFalsePositiveRate` function creates a temporary Bloom filter. It is
 also relatively expensive and only meant for validation.
 
+## Scalable Bloom filters
+
+A `BloomFilter` is sized for a fixed number of items: once insertions exceed
+that number, the false positive rate rises quickly, and the only remedy is to
+rebuild a larger filter from the original keys, which the filter does not
+store. When the number of items is not known in advance, use
+`ScalableBloomFilter`, which stacks a new, larger layer whenever the current
+one is full:
+
+	filter := bloom.NewScalableBloomFilter(1000, 0.01)
+	filter.Add([]byte("Love"))
+	present := filter.Test([]byte("Love"))
+
+Keys inserted earlier stay in their original layer and are still found there.
+Each layer targets a false positive rate tighter than the previous one, so
+the overall false positive rate stays close to the requested `fp` no matter
+how many items are added. Because each layer doubles the capacity of the
+previous one, the number of layers grows only logarithmically with the number
+of items, keeping the cost of a single query bounded.
+
 ## Serialization
 
 You can read and write the Bloom filters as follows:
