@@ -160,9 +160,16 @@ func (f *BloomFilter) BitSet() *bitset.BitSet {
 
 // Add data to the Bloom Filter. Returns the filter (allows chaining)
 func (f *BloomFilter) Add(data []byte) *BloomFilter {
+	if f.k == 0 {
+		return f
+	}
 	h := baseHashes(data)
+	keyLock := f.keyLock(h)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+	words := f.b.Words()
 	for i := uint(0); i < f.k; i++ {
-		f.b.Set(f.location(h, i))
+		bloomSetBit(f, words, f.location(h, i))
 	}
 	return f
 }
@@ -198,9 +205,16 @@ func (f *BloomFilter) AddString(data string) *BloomFilter {
 // If true, the result might be a false positive. If false, the data
 // is definitely not in the set.
 func (f *BloomFilter) Test(data []byte) bool {
+	if f.k == 0 {
+		return true
+	}
 	h := baseHashes(data)
+	keyLock := f.keyLock(h)
+	keyLock.RLock()
+	defer keyLock.RUnlock()
+	words := f.b.Words()
 	for i := uint(0); i < f.k; i++ {
-		if !f.b.Test(f.location(h, i)) {
+		if !bloomTestBit(words, f.location(h, i)) {
 			return false
 		}
 	}
@@ -217,8 +231,16 @@ func (f *BloomFilter) TestString(data string) bool {
 // TestLocations returns true if all locations are set in the BloomFilter, false
 // otherwise.
 func (f *BloomFilter) TestLocations(locs []uint64) bool {
+	if len(locs) == 0 {
+		return true
+	}
+	if keyLock := bloomLocationsKeyLock(f.m, locs); keyLock != nil {
+		keyLock.RLock()
+		defer keyLock.RUnlock()
+	}
+	words := f.b.Words()
 	for i := 0; i < len(locs); i++ {
-		if !f.b.Test(uint(locs[i] % uint64(f.m))) {
+		if !bloomTestBit(words, uint(locs[i]%uint64(f.m))) {
 			return false
 		}
 	}
@@ -230,14 +252,21 @@ func (f *BloomFilter) TestLocations(locs []uint64) bool {
 // the corresponding bits are still set. See also TestOrAdd.
 // Returns the result of Test.
 func (f *BloomFilter) TestAndAdd(data []byte) bool {
+	if f.k == 0 {
+		return true
+	}
 	present := true
 	h := baseHashes(data)
+	keyLock := f.keyLock(h)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+	words := f.b.Words()
 	for i := uint(0); i < f.k; i++ {
 		l := f.location(h, i)
-		if !f.b.Test(l) {
+		if !bloomTestBit(words, l) {
 			present = false
 		}
-		f.b.Set(l)
+		bloomSetBit(f, words, l)
 	}
 	return present
 }
@@ -254,13 +283,20 @@ func (f *BloomFilter) TestAndAddString(data string) bool {
 // If the element is already in the filter, then the filter is unchanged.
 // Returns the result of Test.
 func (f *BloomFilter) TestOrAdd(data []byte) bool {
+	if f.k == 0 {
+		return true
+	}
 	present := true
 	h := baseHashes(data)
+	keyLock := f.keyLock(h)
+	keyLock.Lock()
+	defer keyLock.Unlock()
+	words := f.b.Words()
 	for i := uint(0); i < f.k; i++ {
 		l := f.location(h, i)
-		if !f.b.Test(l) {
+		if !bloomTestBit(words, l) {
 			present = false
-			f.b.Set(l)
+			bloomSetBit(f, words, l)
 		}
 	}
 	return present

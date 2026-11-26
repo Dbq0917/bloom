@@ -255,13 +255,17 @@ that estimating the FP rate will clear the Bloom filter.
 
 ### Goroutine safety
 
-In general, it not safe to access
-the same filter using different goroutines--they are
-unsynchronized for performance. Should you want to access
-a filter from more than one goroutine, you should
-provide synchronization. Typically this is done by using channels (in Go style; so there is only ever one owner),
-or by using `sync.Mutex` to serialize operations. Exceptionally, you may access the same filter from different
-goroutines if you never modify the content of the filter.
+The single-key methods `Add`, `AddString`, `Test`, `TestString`,
+`TestAndAdd`, `TestAndAddString`, `TestOrAdd`, `TestOrAddString` and
+`TestLocations` are safe for concurrent use. Bitmap words are updated with
+atomic compare-and-swap operations, and striped locks serialize concurrent
+operations for the same key so a query for that key cannot observe a partially
+completed insertion.
+
+Whole-filter operations such as `Merge`, `ClearAll`, `ReadFrom`,
+`UnmarshalJSON`, `UnmarshalBinary` and `GobDecode`, as well as direct use of
+the pointer returned by `BitSet`, still require external synchronization with
+concurrent single-key operations.
 
 ## Further reading
 
